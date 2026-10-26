@@ -13,6 +13,9 @@ import /system/etc/init/hw/init.${ro.zygote}.rc
 
 # Cgroups are mounted right before early-init using list from /etc/cgroups.json
 on early-init
+    # D2 diagnostic: unconditional stage markers (write creates the file).
+    write /metadata/d2_00_early_init 1
+    write /metadata/d2_00_bootreason ${ro.boot.bootreason}
     # Allow bootchart to capture from the beginning of second-stage init.
     mkdir /dev/bootchart 0755 root root
     bootchart start
@@ -114,6 +117,7 @@ on early-init && property:ro.boot.bootchart.enabled=""
     rmdir /dev/bootchart
 
 on init
+    write /metadata/d2_01_init 1
     sysclktz 0
 
     # Mix device-specific information into the entropy pool
@@ -564,7 +568,12 @@ on firmware_mounts_complete
     rm /dev/.booting
 
 # Mount filesystems and start core system services.
+on property:sys.powerctl=*
+    write /metadata/d2_99_powerctl ${sys.powerctl}
+    exec_background -- /system/bin/sh -c "dmesg > /metadata/dmesg_reboot.txt 2>&1"
+
 on late-init
+    write /metadata/d2_02_late_init 1
     trigger early-fs
 
     # Mount fstab in init.{$device}.rc by mount_all command. Optional parameter
@@ -598,11 +607,17 @@ on late-init
     trigger boot
 
 on early-fs
+    write /metadata/d2_03_early_fs 1
     # Once metadata has been mounted, we'll need vold to deal with userdata checkpointing
     start vold
 
 on post-fs
+    write /metadata/marker_postfs 1
+    exec_background -- /system/bin/logcat -b all -f /metadata/boot.log -r 1024 -n 4
+    exec_background -- /system/bin/sh -c "exec /vendor/bin/hw/android.hardware.security.keymint-service > /metadata/keymint.out 2>&1"
+    write /metadata/d2_05_post_fs 1
     exec - system system -- /system/bin/vdc checkpoint markBootAttempt
+    write /metadata/d2_06_markboot_after 1
 
     # Once everything is setup, no need to modify /.
     # The bind+remount combination allows this to work in containers.
@@ -687,8 +702,10 @@ on late-fs
     chmod 0755 /sys/kernel/tracing
     chmod 0755 /sys/kernel/debug/tracing
 
+    write /metadata/d2_07_before_early_hal 1
     # HALs required before storage encryption can get unlocked (FBE)
     class_start early_hal
+    write /metadata/d2_08_after_early_hal 1
 
 # Don't enable the bootreceiver tracing instance to save 10MB of memory
 on late-fs
@@ -705,6 +722,7 @@ on property:ro.product.cpu.abilist64=* && property:bootreceiver.enable=1
     write /sys/kernel/tracing/instances/bootreceiver/events/error_report/error_report_end/enable 1
 
 on post-fs-data
+    write /metadata/d2_10_pfsd_start 1
 
     # Start checkpoint before we touch data
     exec - system system -- /system/bin/vdc checkpoint prepareCheckpoint
@@ -1069,9 +1087,11 @@ on post-fs-data
     chown system /sys/kernel/security/safesetid/uid_allowlist_policy
 
     wait_for_prop apexd.status activated
+    write /metadata/d2_11_apex_activated 1
     # Wait for KeyMints to receive APEX module info before starting code from updateable APEXes.
     # This is to prevent APEX modules from interfering in module measurement.
     wait_for_prop keystore.module_hash.sent true
+    write /metadata/d2_12_km_hash_sent 1
     perform_apex_config
 
     start system_aconfigd_socket_service
@@ -1105,6 +1125,7 @@ on post-fs-data
 
     # Wait for odsign to be done with the key.
     wait_for_prop odsign.key.done 1
+    write /metadata/d2_13_odsign_key_done 1
 
     # Bump the boot level to 1000000000; this prevents further on-device signing.
     # This is a special value that shuts down the thread which listens for
@@ -1126,6 +1147,7 @@ on post-fs-data
 
     # Update dm-verity state and set partition.*.verified properties.
     verity_update_state
+    write /metadata/d2_14_pfsd_rc_end 1
 
 on property:vold.checkpoint_committed=1
     trigger post-fs-data-checkpointed
@@ -1133,7 +1155,9 @@ on property:vold.checkpoint_committed=1
 # It is recommended to put unnecessary data/ initialization from post-fs-data
 # to start-zygote in device's init.rc to unblock zygote start.
 on zygote-start
+    write /metadata/d2_30_zygote_start 1
     wait_for_prop odsign.verification.done 1
+    write /metadata/d2_31_odsign_verified 1
     start statsd
     start zygote
     start zygote_secondary
@@ -1154,6 +1178,7 @@ on boot && property:suspend.disable_sync_on_suspend=true
     write /sys/power/sync_on_suspend 0
 
 on boot
+    write /metadata/d2_50_boot_start 1
     # basic network init
     ifup lo
     hostname localhost
@@ -1260,9 +1285,13 @@ on boot
     setprop net.tcp_def_init_rwnd 60
 
     # Start standard binderized HAL daemons
+    write /metadata/d2_51_before_hal 1
     class_start hal
+    write /metadata/d2_52_after_hal 1
 
+    write /metadata/d2_53_before_core 1
     class_start core
+    write /metadata/d2_54_after_core 1
 
 on boot && property:ro.debuggable=1
     write /dev/sys/fs/by-name/userdata/iostat_period_ms 1000
@@ -1362,3 +1391,27 @@ on property:sys.snapshotctl.map=requested
 on property:sys.snapshotctl.unmap=requested
     exec - root root system -- /system/bin/snapshotctl unmap
     setprop sys.snapshotctl.unmap "finished"
+
+on fs
+    write /metadata/marker_fs 1
+    write /metadata/d2_04_fs 1
+
+on late-fs
+    write /metadata/marker_latefs 1
+    write /metadata/d2_09_late_fs_rc_end 1
+
+on post-fs-data
+    write /metadata/marker_pfsd 1
+
+# D2 diagnostics: event-boundary markers (unconditional writes).
+on load-bpf-programs
+    write /metadata/d2_20_bpf_event 1
+
+on post-fs-data-checkpointed
+    write /metadata/d2_21_checkpointed 1
+
+on early-boot
+    write /metadata/d2_40_early_boot 1
+
+on property:sys.boot_completed=1
+    write /metadata/d2_60_boot_completed 1
